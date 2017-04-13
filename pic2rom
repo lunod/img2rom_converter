@@ -1,0 +1,206 @@
+#! /usr/bin/octave -qf
+pkg load image
+
+## pic2rom : generates an hardware ROM in VHDL from a picture file.
+## Copyright (C) 2017 Ludovic Noury <ludovic.noury@esiee.fr>
+## 
+## This program is free software: you can redistribute it and/or
+## modify it under the terms of the GNU General Public License as
+## published by the Free Software Foundation, either version 3 of the
+## License, or (at your option) any later version.
+##
+## This program is distributed in the hope that it will be useful, but
+## WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+## General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with this program.  If not, see
+## <http://www.gnu.org/licenses/>.
+
+## ------------------------------------------------------------------------
+## pic2rom function
+## ------------------------------------------------------------------------
+## pic2rom(INPUTFILE, OUTPUTFILE, ENTITY, R_WL, G_WL, B_WL, VERBOSE)
+##
+## Create the file OUTPUTFILE containing the VHDL description of a ROM
+## initialized from INPUTFILE image content.
+##
+## The generated ROM, named ENTITY has SIZE_X * SIZE_Y elements of
+## R_WL+G_WL+B_WL bits with SIZE_X and SIZE_Y the source image pixels
+## dimensions
+##
+## Produces verbose output if VERBOSE is true.
+##
+## ROM[ADDR] contains the value of pixel X,Y such as :
+## ADDR = Y*SIZE_X + X.
+## Each pixel color value C is coded on R_WL+G_WL+B_WL bit with the
+## following format :
+## - C[R_WL+G_WL+B_WL-1 .. G_WL+B_WL] = red component value on R_WL bits
+## - C[     G_WL+B_WL-1 ..      B_WL] = green component value on G_WL bits
+## - C[          B_WL-1 ..         0] = blue component value on B_WL bits
+##
+## BUGS :
+## - colors are washed out 
+##
+## LIMITATIONS :
+## - only tested only with 8 bits per channel (with RGB png file)
+## - color indexed images are currently unsupported 
+## - only color images are currently supported
+##   (b&w image would produce only one channel)
+## - require r_wl+g_wl+b_wl <= 64
+## - if r_wl+g_wl+b_wl != 16 need to update fprintf format
+## - if x*y > 99999 should update fprintf format (just for
+##   generated VHDL code alignment, not really necessary)
+function pic2rom (inputfile, outputfile, entity, r_wl, g_wl, b_wl, verbose)
+
+  if (nargin != 7)
+    error ("not enough input arguments");
+  endif
+  
+  # Create 3 dimensional matrix :
+  # img(x,y,1) = pixel (x,y) red intensity
+  # img(x,y,2) = pixel (x,y) green intensity
+  # img(x,y,2) = pixel (x,y) blue intensity
+  #
+  # Maximum value per channel depends on source image format
+  img = imread(inputfile);
+  
+  # Scale each channel range to the ranges determined by input
+  # parameters (r_wl, g_wl and b_wl)
+  img = double(img);
+  gamma = 1;
+  img(:,:,1) = imadjust (img(:,:,1), stretchlim (img(:,:,1), 0.01), ...
+			 [0; 2^r_wl - 1], gamma);
+  img(:,:,2) = imadjust (img(:,:,2), stretchlim (img(:,:,2), 0.01), ...
+			 [0; 2^g_wl - 1], gamma);
+  img(:,:,3) = imadjust (img(:,:,3), stretchlim (img(:,:,3), 0.01), ...
+			 [0; 2^b_wl - 1], gamma);
+
+  ## Code without imadjust and stretchlim functions
+  #  img_channel_max = intmax(class(img(1,1,1))) #(before double conversion)
+  #  offset = 0;
+  #img(:,:,1) = offset + (img(:,:,1) * (2^r_wl - 1) / img_channel_max);
+  #img(:,:,2) = offset + (img(:,:,2) * (2^g_wl - 1) / img_channel_max);
+  #img(:,:,3) = offset + (img(:,:,3) * (2^b_wl - 1) / img_channel_max);
+  img = uint64(round(img));
+
+  # Build 2 dimensional matrix with RGB channels merged following
+  # request output format (depends on r_wl, g_wl and b_wl)
+  rom_wl = r_wl + g_wl + b_wl;
+  rom_mat = bitor(bitor(bitshift(img(:,:,1), b_wl+g_wl, rom_wl), ...
+  			bitshift(img(:,:,2), b_wl     , rom_wl)), ...
+  	          img(:,:,3));
+
+  # Write ROM description in VHDL 
+  # * ROM word-length = r_wl + g_wl + b_wl
+  # * ROM elements = source_image_max_x * source_image_max_y
+  # * ROM address word-length = roundup(log2(x*y))
+  rom_addr_wl = ceil(log2(numel(rom_mat)));
+  
+  f = fopen(outputfile, 'w');
+  fprintf(f, "\
+---------------------------------------------------------------------------\n\
+library ieee;\n\
+use ieee.std_logic_1164.all;\n\
+use ieee.numeric_std.all;\n\
+---------------------------------------------------------------------------\n\
+entity %s is\n\
+\n\
+  port(addr : in  std_logic_vector(%d downto 0);\n\
+       clk  : in  std_logic;\n\
+       q    : out std_logic_vector(%d downto 0));\n\
+\n\
+end entity;\n\
+---------------------------------------------------------------------------\n\
+architecture rtl of %s is\n\
+\n\
+  -- Build a 2-D array type for the ROM\n\
+  subtype word_t is std_logic_vector(q'range);                 -- word size = q size\n\
+  type memory_t is array(0 to (2**addr'length) - 1) of word_t; -- number of words = 2^nbits(addr)\n\
+\n\
+  function init_rom\n\
+    return memory_t is\n\
+    variable tmp : memory_t := (others => (others => '0'));\n\
+  begin\n\
+", ...
+	  entity, ...
+	  rom_addr_wl - 1,
+	  rom_wl - 1,
+	  entity);
+  rom_address = 0;
+  for i = 1:rows(rom_mat)
+    for j = 1:columns(rom_mat)
+      fprintf(f,'    tmp(%05d) := x"%04x";\n', rom_address, rom_mat(i,j));
+      rom_address = rom_address + 1;
+    endfor
+  endfor
+
+  fprintf(f, "\
+    --end loop;\n\
+    return tmp;\n\
+  end init_rom;\n\
+\n\
+  signal rom : memory_t := init_rom;\n\
+\n\
+begin\n\
+\n\
+  process(clk)\n\
+  begin\n\
+    if(rising_edge(clk)) then\n\
+      q <= rom(to_integer(unsigned(addr)));\n\
+    end if;\n\
+  end process;\n\
+\n\
+end rtl;\n\
+---------------------------------------------------------------------------\n\
+");
+  fclose(f);
+
+  if (verbose)
+printf ("\
+debug:pic2rom() \n\
+  * wrote VHDL description of ROM \"%s\" into \"%s\"\n\
+  * \"%s\" used as source for ROM content\n\
+  * %d words (1 word per pixel), %d bits for address\n\
+  * word length = %d bits (word value = pixel color)\n\
+     * red   = bits[%02d-%02d]\n\
+     * blue  = bits[%02d-%02d]\n\
+     * green = bits[%02d-%02d]\n", ...
+	entity, outputfile, ...
+	inputfile, ...
+	numel(rom_mat), rom_addr_wl, ...
+	rom_wl, ...
+	rom_wl -1        , b_wl+g_wl, ...
+	b_wl+g_wl-1, b_wl, ...
+	b_wl-1           , 0);
+
+  endif 
+endfunction
+
+## ------------------------------------------------------------------------
+## Wrapping octave pic2rom function into an executable program
+## ------------------------------------------------------------------------
+
+## Check command line arguments
+if (nargin != 6)
+  error ("not enough input arguments.\n\
+\n\
+usage: pic2rom INPUTFILE OUTPUTFILE ENTITY R_WL G_WL B_WL\n\n\
+example: pic2rom kodim23_edited.png rom_img.vhd rom_img 5 6 5\n\n",
+	 program_name());
+endif
+
+## Extract arguments
+arg_list = argv();
+IMAGE_FILENAME = arg_list{1};
+ROM_FILENAME   = arg_list{2};
+ENTITY_NAME    = arg_list{3};
+RED_WL         = str2num(arg_list{4});
+GREEN_WL       = str2num(arg_list{5});
+BLUE_WL        = str2num(arg_list{6});
+VERBOSE        = true;
+
+## call function and returns
+pic2rom(IMAGE_FILENAME, ROM_FILENAME, ENTITY_NAME, ...
+	RED_WL, GREEN_WL, BLUE_WL, VERBOSE)
